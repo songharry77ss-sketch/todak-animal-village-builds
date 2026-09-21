@@ -1,0 +1,143 @@
+name: iOS Simulator screenshot validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release label for the verified simulator export
+        required: true
+        default: v2.1.2-rc.1
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  capture-ios:
+    if: github.repository == 'songharry77ss-sketch/todak-animal-village-builds' && github.ref == 'refs/heads/main' && github.actor == 'songharry77ss-sketch'
+    runs-on: macos-26
+    timeout-minutes: 40
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      BUNDLE_ID: com.todaktodak.animalvillage
+    steps:
+      - name: Download simulator Xcode export
+        shell: bash
+        env:
+          IOS_SIMULATOR_EXPORT_URL: ${{ secrets.IOS_SIMULATOR_EXPORT_URL }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ ]]
+          mkdir -p "$RUNNER_TEMP/todak-simulator" "$RUNNER_TEMP/todak-ios-shots"
+          curl --fail --silent --show-error --location "$IOS_SIMULATOR_EXPORT_URL" --output "$RUNNER_TEMP/todak-simulator/TodakAnimalVillage-iOS-Simulator-Xcode.zip"
+          printf 'eb75ff84bce085ddc5d36ada0e5bbb3c6c3cfb744ab9d2277c394bc1aceebd3d  %s\n' "$RUNNER_TEMP/todak-simulator/TodakAnimalVillage-iOS-Simulator-Xcode.zip" | shasum -a 256 --check
+          shasum -a 256 "$RUNNER_TEMP/todak-simulator/TodakAnimalVillage-iOS-Simulator-Xcode.zip" > "$RUNNER_TEMP/todak-ios-shots/export-sha256.txt"
+          unzip -q "$RUNNER_TEMP/todak-simulator/TodakAnimalVillage-iOS-Simulator-Xcode.zip" -d "$RUNNER_TEMP/todak-simulator"
+
+      - name: Compile simulator app
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -project "$RUNNER_TEMP/todak-simulator/iOSSimulator/Unity-iPhone.xcodeproj" \
+            -scheme Unity-iPhone -configuration Release \
+            -destination 'generic/platform=iOS Simulator' -sdk iphonesimulator \
+            -derivedDataPath "$RUNNER_TEMP/todak-simulator-derived" \
+            ARCHS="$(uname -m)" ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' DEVELOPMENT_TEAM='' \
+            build > "$RUNNER_TEMP/todak-ios-shots/xcodebuild-simulator.log" 2>&1
+          app_path="$(find "$RUNNER_TEMP/todak-simulator-derived/Build/Products" -type d -name '*.app' -path '*Release-iphonesimulator*' -print -quit)"
+          test -n "$app_path"
+          printf 'app_path=%s\n' "$app_path" >> "$GITHUB_OUTPUT"
+
+      - name: Select iPhone and iPad simulators
+        id: devices
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcrun simctl list devices available --json > "$RUNNER_TEMP/todak-ios-shots/simulators.json"
+          python3 - "$GITHUB_OUTPUT" "$RUNNER_TEMP/todak-ios-shots/simulators.json" <<'PY'
+          import json, sys
+          output, source = sys.argv[1:]
+          data = json.load(open(source))['devices']
+          rows = [(runtime, device) for runtime, devices in data.items()
+                  if '.SimRuntime.iOS-' in runtime
+                  for device in devices if device.get('isAvailable', True)]
+          def choose(tablet):
+              candidates = [(runtime, device) for runtime, device in rows
+                            if ('iPad' in device['name']) == tablet]
+              if not candidates:
+                  raise SystemExit('No available ' + ('iPad' if tablet else 'iPhone') + ' simulator')
+              def score(item):
+                  runtime, device = item
+                  name = device['name']
+                  preferred = ('13-inch' in name or '12.9-inch' in name) if tablet else ('Pro Max' in name)
+                  return (runtime, preferred, name)
+              return max(candidates, key=score)[1]
+          phone, tablet = choose(False), choose(True)
+          with open(output, 'a') as stream:
+              stream.write(f"phone={phone['udid']}\nphone_name={phone['name']}\n")
+              stream.write(f"tablet={tablet['udid']}\ntablet_name={tablet['name']}\n")
+          print('Selected:', phone['name'], 'and', tablet['name'])
+          PY
+
+      - name: Run verified tour and capture iOS screens
+        shell: bash
+        env:
+          APP_PATH: ${{ steps.build.outputs.app_path }}
+          PHONE_UDID: ${{ steps.devices.outputs.phone }}
+          PHONE_NAME: ${{ steps.devices.outputs.phone_name }}
+          TABLET_UDID: ${{ steps.devices.outputs.tablet }}
+          TABLET_NAME: ${{ steps.devices.outputs.tablet_name }}
+        run: |
+          set -euo pipefail
+          run_tour() {
+            local udid="$1" label="$2" device_name="$3"
+            local output="$RUNNER_TEMP/todak-ios-shots/$label"
+            xcrun simctl boot "$udid" 2>/dev/null || true
+            xcrun simctl bootstatus "$udid" -b
+            xcrun simctl install "$udid" "$APP_PATH"
+            local container
+            container="$(xcrun simctl get_app_container "$udid" "$BUNDLE_ID" data)"
+            local tour="$container/Documents/todak-tour"
+            mkdir -p "$tour" "$output"
+            SIMCTL_CHILD_TODAK_TOUR="$tour" SIMCTL_CHILD_TODAK_SHOT_SCALE=1 SIMCTL_CHILD_TODAK_OFFSCREEN_CAPTURE=1 \
+            xcrun simctl launch --terminate-running-process "$udid" "$BUNDLE_ID" \
+              "-todakTour=$tour" -todakShotScale=1 -todakOffscreenCapture > "$output/launch.txt"
+            for _ in $(seq 1 135); do
+              [[ -f "$tour/report.txt" ]] && break
+              sleep 5
+            done
+            if [[ ! -f "$tour/report.txt" ]]; then
+              xcrun simctl io "$udid" screenshot "$output/diagnostic.png" || true
+              xcrun simctl spawn "$udid" log show --last 15m \
+                --predicate 'process == "ProductName"' > "$output/simulator-app.log" 2>&1 || true
+              return 1
+            fi
+            cp "$tour/report.txt" "$output/"
+            shopt -s nullglob
+            local screenshots=("$tour"/*.png)
+            if (( ${#screenshots[@]} == 0 )); then
+              xcrun simctl io "$udid" screenshot "$output/diagnostic.png" || true
+              return 1
+            fi
+            cp "${screenshots[@]}" "$output/"
+            printf '%s\n' "$device_name" > "$output/device.txt"
+            xcrun simctl shutdown "$udid"
+          }
+          run_tour "$PHONE_UDID" iphone "$PHONE_NAME"
+          run_tour "$TABLET_UDID" ipad "$TABLET_NAME"
+          for output in "$RUNNER_TEMP/todak-ios-shots/iphone" "$RUNNER_TEMP/todak-ios-shots/ipad"; do
+            grep -q '오류 0건' "$output/report.txt"
+            test "$(find "$output" -name '*.png' | wc -l | tr -d ' ')" -ge 60
+          done
+
+      - name: Preserve simulator screenshots
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ios-simulator-screenshots-${{ github.run_id }}
+          path: ${{ runner.temp }}/todak-ios-shots/
+          retention-days: 3
+          if-no-files-found: error

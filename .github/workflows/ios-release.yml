@@ -1,0 +1,171 @@
+name: iOS TestFlight release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release label for the verified device export
+        required: true
+        default: v2.1.2-rc.1
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  archive-and-upload:
+    if: github.repository == 'songharry77ss-sketch/todak-animal-village-builds' && github.ref == 'refs/heads/main' && github.actor == 'songharry77ss-sketch'
+    runs-on: macos-26
+    timeout-minutes: 55
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+      IOS_CERTIFICATE_BASE64: ${{ secrets.IOS_CERTIFICATE_BASE64 }}
+      IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+      IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+      IOS_PROVISIONING_PROFILE_NAME: ${{ secrets.IOS_PROVISIONING_PROFILE_NAME }}
+
+    steps:
+      - name: Check required credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          for variable in APPLE_TEAM_ID ASC_KEY_ID ASC_ISSUER_ID ASC_PRIVATE_KEY IOS_CERTIFICATE_BASE64 IOS_CERTIFICATE_PASSWORD IOS_PROVISIONING_PROFILE_BASE64 IOS_PROVISIONING_PROFILE_NAME; do
+            [[ -n "${!variable:-}" ]] || { echo "Missing required secret: $variable" >&2; exit 1; }
+          done
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ ]]
+
+      - name: Download private Xcode export
+        shell: bash
+        env:
+          IOS_EXPORT_URL: ${{ secrets.IOS_EXPORT_URL }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/todak-export" "$RUNNER_TEMP/todak-reports" "$RUNNER_TEMP/todak-output"
+          curl --fail --silent --show-error --location "$IOS_EXPORT_URL" --output "$RUNNER_TEMP/todak-export/TodakAnimalVillage-iOS-Xcode.zip"
+          printf '3ecfa43ac71ccd85df297a1fa5324d7dbc3ed84f5dd7e4f0171c0d861d290cc4  %s\n' "$RUNNER_TEMP/todak-export/TodakAnimalVillage-iOS-Xcode.zip" | shasum -a 256 --check
+          shasum -a 256 "$RUNNER_TEMP/todak-export/TodakAnimalVillage-iOS-Xcode.zip" > "$RUNNER_TEMP/todak-reports/export-sha256.txt"
+          unzip -q "$RUNNER_TEMP/todak-export/TodakAnimalVillage-iOS-Xcode.zip" -d "$RUNNER_TEMP/todak-export"
+          xcodebuild -version | tee "$RUNNER_TEMP/todak-reports/xcode-version.txt"
+
+      - name: Install signing identity and provisioning profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          KEYCHAIN_PATH="$RUNNER_TEMP/todak-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)$(uuidgen)"
+          P12_PATH="$RUNNER_TEMP/todak-distribution.p12"
+          PROFILE_PATH="$RUNNER_TEMP/todak.mobileprovision"
+
+          printf '%s' "$IOS_CERTIFICATE_BASE64" | base64 --decode > "$P12_PATH"
+          printf '%s' "$IOS_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$PROFILE_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$P12_PATH" -P "$IOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" "$HOME/Library/Keychains/login.keychain-db"
+
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          PROFILE_UUID="$(security cms -D -i "$PROFILE_PATH" | plutil -extract UUID raw -)"
+          cp "$PROFILE_PATH" "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
+          printf 'PROFILE_UUID=%s\n' "$PROFILE_UUID" >> "$GITHUB_ENV"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH" > "$RUNNER_TEMP/todak-reports/signing-identities.txt"
+
+      - name: Archive signed app
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROJECT="$RUNNER_TEMP/todak-export/iOS/Unity-iPhone.xcodeproj"
+          ARCHIVE="$RUNNER_TEMP/todak-output/TodakAnimalVillage.xcarchive"
+          xcodebuild -project "$PROJECT" \
+            -scheme Unity-iPhone -configuration Release \
+            -destination 'generic/platform=iOS' -sdk iphoneos \
+            -archivePath "$ARCHIVE" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY='Apple Distribution' \
+            PROVISIONING_PROFILE_APP="$PROFILE_UUID" \
+            PROVISIONING_PROFILE_SPECIFIER_APP="$IOS_PROVISIONING_PROFILE_NAME" \
+            clean archive 2>&1 | tee "$RUNNER_TEMP/todak-reports/xcodebuild-archive.log"
+
+          APP_PATH="$(find "$ARCHIVE/Products/Applications" -maxdepth 1 -name '*.app' -type d -print -quit)"
+          test -n "$APP_PATH"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH" \
+            2>&1 | tee "$RUNNER_TEMP/todak-reports/codesign-verify.txt"
+          /usr/libexec/PlistBuddy -c 'Print :ApplicationProperties:CFBundleIdentifier' "$ARCHIVE/Info.plist" | tee "$RUNNER_TEMP/todak-reports/bundle-id.txt"
+          /usr/libexec/PlistBuddy -c 'Print :ApplicationProperties:CFBundleShortVersionString' "$ARCHIVE/Info.plist" | tee "$RUNNER_TEMP/todak-reports/version.txt"
+          /usr/libexec/PlistBuddy -c 'Print :ApplicationProperties:CFBundleVersion' "$ARCHIVE/Info.plist" | tee -a "$RUNNER_TEMP/todak-reports/version.txt"
+
+      - name: Export App Store IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>export</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>teamID</key><string>$APPLE_TEAM_ID</string>
+            <key>signingCertificate</key><string>Apple Distribution</string>
+            <key>provisioningProfiles</key><dict>
+              <key>com.todaktodak.animalvillage</key><string>$IOS_PROVISIONING_PROFILE_NAME</string>
+            </dict>
+            <key>stripSwiftSymbols</key><true/>
+            <key>uploadSymbols</key><true/>
+          </dict></plist>
+          PLIST
+          plutil -lint "$RUNNER_TEMP/ExportOptions.plist"
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/todak-output/TodakAnimalVillage.xcarchive" \
+            -exportPath "$RUNNER_TEMP/todak-output/export" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            2>&1 | tee "$RUNNER_TEMP/todak-reports/xcodebuild-export.log"
+          IPA_PATH="$(find "$RUNNER_TEMP/todak-output/export" -maxdepth 1 -name '*.ipa' -print -quit)"
+          test -n "$IPA_PATH"
+          shasum -a 256 "$IPA_PATH" | tee "$RUNNER_TEMP/todak-reports/ipa-sha256.txt"
+          printf 'IPA_PATH=%s\n' "$IPA_PATH" >> "$GITHUB_ENV"
+
+      - name: Upload build to App Store Connect
+        shell: bash
+        run: |
+          set -euo pipefail
+          PRIVATE_KEYS_DIR="$HOME/.appstoreconnect/private_keys"
+          mkdir -p "$PRIVATE_KEYS_DIR"
+          printf '%s' "$ASC_PRIVATE_KEY" > "$PRIVATE_KEYS_DIR/AuthKey_$ASC_KEY_ID.p8"
+          chmod 600 "$PRIVATE_KEYS_DIR/AuthKey_$ASC_KEY_ID.p8"
+          xcrun altool --upload-app --type ios --file "$IPA_PATH" \
+            --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID" \
+            2>&1 | tee "$RUNNER_TEMP/todak-reports/appstore-upload.txt"
+          printf 'Signed iOS build uploaded to App Store Connect. Version and build:\n' > "$RUNNER_TEMP/todak-reports/result.txt"
+          cat "$RUNNER_TEMP/todak-reports/version.txt" >> "$RUNNER_TEMP/todak-reports/result.txt"
+
+      - name: Preserve release evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ios-testflight-release-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/todak-reports/export-sha256.txt
+            ${{ runner.temp }}/todak-reports/ipa-sha256.txt
+            ${{ runner.temp }}/todak-reports/version.txt
+            ${{ runner.temp }}/todak-reports/result.txt
+            ${{ runner.temp }}/todak-reports/xcode-version.txt
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: Remove ephemeral signing material
+        if: always()
+        shell: bash
+        run: |
+          security delete-keychain "$RUNNER_TEMP/todak-signing.keychain-db" || true
+          rm -f "$RUNNER_TEMP/todak-distribution.p12" "$RUNNER_TEMP/todak.mobileprovision"
+          rm -f "$HOME/.appstoreconnect/private_keys/AuthKey_$ASC_KEY_ID.p8"
+          if [[ -n "${PROFILE_UUID:-}" ]]; then
+            rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
+          fi
