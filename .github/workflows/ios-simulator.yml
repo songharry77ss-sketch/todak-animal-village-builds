@@ -6,7 +6,7 @@ on:
       release_tag:
         description: Release label for the verified simulator export
         required: true
-        default: v2.1.3-rc.1
+        default: v2.2.0-rc.1
         type: string
 
 permissions:
@@ -16,7 +16,7 @@ jobs:
   capture-ios:
     if: github.repository == 'songharry77ss-sketch/todak-animal-village-builds' && github.ref == 'refs/heads/main' && github.actor == 'songharry77ss-sketch'
     runs-on: macos-26
-    timeout-minutes: 40
+    timeout-minutes: 55
     env:
       RELEASE_TAG: ${{ inputs.release_tag }}
       BUNDLE_ID: com.todaktodak.animalvillage
@@ -30,7 +30,7 @@ jobs:
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ ]]
           mkdir -p "$RUNNER_TEMP/todak-simulator" "$RUNNER_TEMP/todak-ios-shots"
           curl --fail --silent --show-error --location "$IOS_SIMULATOR_EXPORT_URL" --output "$RUNNER_TEMP/todak-simulator/TodakAnimalVillage-iOS-Simulator-Xcode.zip"
-          printf 'bf7be8091ed6f864764da7f3f4065c0e28f487ed64b81267ab288669644c973c  %s\n' "$RUNNER_TEMP/todak-simulator/TodakAnimalVillage-iOS-Simulator-Xcode.zip" | shasum -a 256 --check
+          printf '265e105daeaf80e726275f87a84fe15427bafde6e0def43c3e43af0fee90ddff  %s\n' "$RUNNER_TEMP/todak-simulator/TodakAnimalVillage-iOS-Simulator-Xcode.zip" | shasum -a 256 --check
           shasum -a 256 "$RUNNER_TEMP/todak-simulator/TodakAnimalVillage-iOS-Simulator-Xcode.zip" > "$RUNNER_TEMP/todak-ios-shots/export-sha256.txt"
           unzip -q "$RUNNER_TEMP/todak-simulator/TodakAnimalVillage-iOS-Simulator-Xcode.zip" -d "$RUNNER_TEMP/todak-simulator"
 
@@ -105,7 +105,7 @@ jobs:
             SIMCTL_CHILD_TODAK_TOUR="$tour" SIMCTL_CHILD_TODAK_SHOT_SCALE=1 SIMCTL_CHILD_TODAK_OFFSCREEN_CAPTURE=1 \
             xcrun simctl launch --terminate-running-process "$udid" "$BUNDLE_ID" \
               "-todakTour=$tour" -todakShotScale=1 -todakOffscreenCapture > "$output/launch.txt"
-            for _ in $(seq 1 135); do
+            for _ in $(seq 1 200); do
               [[ -f "$tour/report.txt" ]] && break
               sleep 5
             done
